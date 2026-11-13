@@ -36,8 +36,7 @@ LDFLAGS := $(SAN)
 # The runtime is every file in runtime/, with only the selected poller backend.
 RUNTIME_SRC := $(filter-out runtime/poller_%.c,$(wildcard runtime/*.c)) \
                $(wildcard runtime/poller_$(POLLER).c)
-# examples/async_dsl.c is the superseded sketch. It has no main(); M1 removes it.
-EXAMPLE_SRC := $(filter-out examples/async_dsl.c,$(wildcard examples/*.c))
+EXAMPLE_SRC := $(wildcard examples/*.c)
 # One program per test. Exit code 0 means pass.
 TEST_SRC    := $(wildcard tests/test_*.c)
 

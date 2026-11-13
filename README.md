@@ -2,7 +2,7 @@
 
 A minimal, single-threaded async runtime in C11, built from scratch to learn how runtimes like Tokio work inside.
 
-**Status: design proposal.** This README is the design. M0 (tooling) is in place; no runtime code exists yet. `examples/async_dsl.c` is an early sketch of the error-handling macros. It is superseded by the design below and will be removed in M1.
+**Status: design proposal.** This README is the design. M0 (tooling) and M1 (coroutines without I/O) are implemented. M2 to M5 are not.
 
 ---
 
@@ -289,7 +289,7 @@ Simplified expansion:
 1. **State that must survive a suspension lives in the frame.**
    - Locals declared *before* `ASYNC_BEGIN` are recomputed on every poll, so they are safe. The frame pointer is the usual one.
    - Locals inside the body lose their values at every `AWAIT` and `YIELD`.
-2. **No `AWAIT` or `YIELD` inside a `switch` statement**, because the macros are `case` labels. Use `if`/`else`. Loops are fine.
+2. **No `AWAIT` or `YIELD` inside a `switch` statement**, because the macros are `case` labels. Use `if`/`else`. Loops are fine. A violation compiles, but it is caught at run time: the task aborts when it is resumed.
 3. **At most one `AWAIT` or `YIELD` per source line**, because `__LINE__` is the resume ID.
 4. **`AWAIT` evaluates its future argument more than once.** Pass a plain pointer, and start the operation on the line before it.
 5. **Only the task function can suspend**; helper functions cannot `AWAIT`. To reuse async logic, spawn a child task and join it.
@@ -490,6 +490,7 @@ runtime/
   task.c     task.h      spawn, wake, detach, join, cancel, deadlines
   future.c   future.h    one-shot futures
   async.h                ASYNC_BEGIN, AWAIT, AWAIT_TRY, YIELD, ASYNC_FAIL, ASYNC_CLEANUP, ASYNC_END
+  internal.h             shared by the runtime's own .c files; not part of the API
   timer.c    timer.h     deadline min-heap, sleep_ms
   reactor.c  reactor.h   fd table, io_* operations, io_close
   poller.h               backend interface
@@ -502,6 +503,7 @@ examples/
   echo_server.c          M5
 tests/
   test_*.c               one program per test; exit code 0 means pass
+  test.h                 CHECK and the runtime_stats check that ends every test
 Makefile
 ```
 
@@ -551,17 +553,22 @@ Each milestone is done only when its tests pass under `make test` **and** `make 
 - **Done:** a trivial test passes on both backends.
 
 ### M1 — Coroutines without I/O
-- `task_t`, `async.h` (`ASYNC_BEGIN`, `YIELD`, `ASYNC_FAIL`, `ASYNC_CLEANUP`, `ASYNC_END`), a FIFO run queue, `task_runtime` and `runtime_stats`.
-- No OS calls yet.
+- `task_t`, `async.h` (`ASYNC_BEGIN`, `YIELD`, `ASYNC_FAIL`, `ASYNC_CLEANUP`, `ASYNC_END`), a FIFO run queue, `task_detach`, `task_runtime` and `runtime_stats`.
+- `task_detach` is here, not in M2, because it is the only way to consume a handle before join exists. Without it no test could end with `runtime_stats` at zero.
+- No OS calls yet. With no timers and no I/O, the loop returns `EDEADLK` as soon as tasks are live and the run queue is empty. `runtime_free` frees a task that is still live without running its cleanup; M2 replaces that with the shutdown.
 - Remove `examples/async_dsl.c`.
 - **Done:**
-  - two tasks interleave in the expected order;
+  - two tasks interleave in the expected order, and a task spawned during a pass first runs on the next pass;
   - a test demonstrates rule 1 (locals lose their values, frame fields don't);
   - `ASYNC_FAIL` reaches cleanup with its code;
+  - a finished task stays in `runtime_stats` until its handle is detached;
+  - a stuck task makes `runtime_run` return `EDEADLK`;
+  - a `YIELD` in cleanup, `ASYNC_FAIL(t, 0)` and a `YIELD` inside a `switch` each abort;
+  - `examples/countdown.c` prints the expected output;
   - no warnings on gcc or clang.
 
 ### M2 — Futures, wake, join, cancellation
-- `future_t` with `future_begin` and the drop hook, `AWAIT`, `AWAIT_TRY`, the cooperative budget, the duplicate-wake guard, `task_detach`, `task_join`, `task_cancel` and the shutdown in `runtime_free`.
+- `future_t` with `future_begin` and the drop hook, `AWAIT`, `AWAIT_TRY`, the cooperative budget, the duplicate-wake guard, `task_join`, `task_cancel` and the shutdown in `runtime_free`.
 - The only built-in operation so far is join, so the tests define their own operation on top of `future_begin`.
 - **Done:**
   - a consumer awaits a future that a producer task completes;
