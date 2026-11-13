@@ -53,3 +53,6 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# toronto build output (one directory per OS and poller backend)
+build/

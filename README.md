@@ -2,7 +2,7 @@
 
 A minimal, single-threaded async runtime in C11, built from scratch to learn how runtimes like Tokio work inside.
 
-**Status: design proposal.** This README is the design. No milestone is implemented yet. `examples/async_dsl.c` is an early sketch of the error-handling macros. It is superseded by the design below and will be removed in M1.
+**Status: design proposal.** This README is the design. M0 (tooling) is in place; no runtime code exists yet. `examples/async_dsl.c` is an early sketch of the error-handling macros. It is superseded by the design below and will be removed in M1.
 
 ---
 
