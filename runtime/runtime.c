@@ -20,6 +20,25 @@ void runtime_free(runtime_t *rt)
     if (rt == NULL)
         return;
     assert(!rt->running && "runtime_free called from inside runtime_run");
+
+    /*
+     * The bounded shutdown. Cancel every task that is still live, then poll
+     * until all of them have finished. This ends without waiting for
+     * anything, because a cancelled task cannot start an operation and a
+     * cleanup section cannot suspend.
+     */
+    if (rt->live > 0) {
+        rt->shutting_down = true;
+        for (task_t *t = rt->all; t != NULL; t = t->all_next)
+            task_cancel(t, ECANCELED);
+        (void)runtime_run(rt);
+    }
+
+    /*
+     * What is left: finished tasks whose handle was never consumed, and any
+     * task that broke the contract by suspending without arranging a wake.
+     * Such a task is freed without running its cleanup section.
+     */
     while (rt->all != NULL)
         task_free(rt->all);
     free(rt);
@@ -48,19 +67,15 @@ void runtime_enqueue(runtime_t *rt, task_t *t)
 static void poll_task(runtime_t *rt, task_t *t)
 {
     t->state = TASK_RUNNING;
+    t->budget = TASK_BUDGET;
 
     if (t->fn(t) == POLL_READY) {
-        t->state = TASK_FINISHED;
-        t->flags &= ~TASK_NOTIFIED;     /* a wake during the last poll is discarded */
-        rt->live--;
-        if (t->flags & TASK_DETACHED)
-            task_free(t);
+        task_finish(t);
         return;
     }
 
     if (t->flags & TASK_NOTIFIED) {     /* woken during the poll, e.g. by YIELD */
         t->flags &= ~TASK_NOTIFIED;
-        t->state = TASK_IDLE;
         runtime_enqueue(rt, t);
     } else {
         t->state = TASK_IDLE;
@@ -76,8 +91,8 @@ int runtime_run(runtime_t *rt)
 
     while (rt->live > 0) {
         /*
-         * M1 has no timers and no I/O, so an empty run queue means that
-         * nothing can ever wake the tasks that are still live.
+         * There are no timers and no I/O yet, so an empty run queue means
+         * that nothing can ever wake the tasks that are still live.
          */
         if (rt->queue_head == NULL) {
             result = EDEADLK;
@@ -86,8 +101,8 @@ int runtime_run(runtime_t *rt)
 
         /*
          * One pass polls only the tasks that were queued when it began. A
-         * task that is queued during the pass, by a spawn or by a YIELD,
-         * waits for the next pass.
+         * task that is queued during the pass, by a spawn, a wake or a
+         * YIELD, waits for the next pass.
          */
         task_t *batch = rt->queue_head;
         rt->queue_head = NULL;

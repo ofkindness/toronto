@@ -1,10 +1,12 @@
 /*
- * M1: a task that returns POLL_PENDING without arranging a wake is never
- * polled again. When nothing else is live, runtime_run returns EDEADLK
- * instead of spinning.
+ * A task that returns POLL_PENDING without arranging a wake is never polled
+ * again. When nothing else is live, runtime_run returns EDEADLK instead of
+ * spinning.
  *
- * This test cannot end with CHECK_NOTHING_LEFT: in M1 the stuck task can only
- * be freed by runtime_free. The sanitizers check that nothing leaks.
+ * This test cannot end with CHECK_NOTHING_LEFT. Its task is written without
+ * the macros and ignores cancellation, so even the shutdown in runtime_free
+ * cannot finish it: runtime_free polls it once more and then frees it as it
+ * is. The sanitizers check that nothing leaks.
  */
 #include <errno.h>
 
@@ -47,6 +49,8 @@ int main(void)
     runtime_stats(rt, &stats);
     CHECK(stats.tasks == 1);
 
+    /* The shutdown cancels and wakes it, and it suspends again without a wake. */
     runtime_free(rt);
+    CHECK(polls == 2);
     return 0;
 }

@@ -29,8 +29,9 @@ int runtime_run(runtime_t *rt);
  * Frees the runtime and every task it still holds, including finished tasks
  * whose handle was never consumed.
  *
- * M1: a task that is still live is freed without running its cleanup section.
- * M2 replaces this with the bounded shutdown: cancel, then finish.
+ * If tasks are still live, this is first a bounded shutdown: each one is
+ * cancelled with ECANCELED and polled until it has run its cleanup section
+ * and finished. A task spawned during the shutdown starts cancelled.
  */
 void runtime_free(runtime_t *rt);
 
