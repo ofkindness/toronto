@@ -12,6 +12,7 @@
 #include <stddef.h>
 
 #include "runtime/future.h"
+#include "runtime/poller.h"
 #include "runtime/runtime.h"
 #include "runtime/task.h"
 
@@ -26,6 +27,17 @@ struct runtime {
     size_t  live;           /* tasks that have not finished */
     bool    running;        /* inside runtime_run */
     bool    shutting_down;  /* inside runtime_free: new tasks start cancelled */
+
+    poller_t *poller;
+
+    timer_entry_t **heap;   /* binary min-heap, ordered by (deadline, seq) */
+    size_t   heap_len;
+    size_t   heap_cap;      /* always >= tasks + future_timers: see timer_reserve */
+    size_t   future_timers; /* armed entries that belong to a future */
+    uint64_t timer_seq;
+
+    bool     virtual_time;  /* the clock is virtual_now, and the loop never sleeps */
+    uint64_t virtual_now;
 };
 
 /* Appends an idle or running task to the run queue. */
@@ -53,5 +65,38 @@ void task_free(task_t *t);
  * drop hook is called.
  */
 void future_drop_all(task_t *t);
+
+/* Drops the operation on a pending future, then fails the future with error. */
+void future_drop_and_fail(future_t *f, int error);
+
+/* The timer heap. */
+
+enum {                      /* timer_entry->kind */
+    TIMER_SLEEP = 1,        /* owner is a future: complete it with 0 */
+    TIMER_TIMEOUT,          /* owner is a future: drop its operation, fail with ETIMEDOUT */
+    TIMER_DEADLINE          /* owner is a task: cancel it with ETIMEDOUT */
+};
+
+/*
+ * Makes room for `slots` entries in total. Returns 0 or ENOMEM.
+ *
+ * The heap always has room for one deadline per task and for every armed
+ * future timer. A task reserves its slot when it is spawned and a future
+ * timer when it is armed, so task_set_deadline can never fail.
+ */
+int timer_reserve(runtime_t *rt, size_t slots);
+
+/* Arms an entry, or re-arms it with a new deadline. The slot must be reserved. */
+void timer_arm(runtime_t *rt, timer_entry_t *e, unsigned kind, void *owner,
+               uint64_t deadline);
+
+/* Takes an entry out of the heap. Does nothing if it is not armed. */
+void timer_disarm(runtime_t *rt, timer_entry_t *e);
+
+/* The earliest deadline, if any entry is armed. */
+bool timer_next(const runtime_t *rt, uint64_t *deadline);
+
+/* Fires every entry whose deadline is not after now, earliest first. */
+void timer_fire_due(runtime_t *rt, uint64_t now);
 
 #endif

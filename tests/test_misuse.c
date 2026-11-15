@@ -17,6 +17,7 @@
 #include "runtime/future.h"
 #include "runtime/runtime.h"
 #include "runtime/task.h"
+#include "runtime/timer.h"
 #include "tests/slot.h"
 #include "tests/test.h"
 
@@ -182,6 +183,18 @@ static poll_t cancels_with_zero(task_t *t)
     ASYNC_END(t);
 }
 
+/* A sleep is its own timer: it cannot also have a timeout. */
+static poll_t puts_a_timeout_on_a_sleep(task_t *t)
+{
+    struct scratch *f = task_frame(t);
+
+    ASYNC_BEGIN(t);
+    sleep_ms(t, &f->fut, 10);
+    future_set_timeout(&f->fut, 5);
+    ASYNC_CLEANUP(t);
+    ASYNC_END(t);
+}
+
 int main(void)
 {
     CHECK(!aborts(behaves));
@@ -196,5 +209,7 @@ int main(void)
     CHECK(aborts(settles_a_future_twice));
     CHECK(aborts(fails_a_future_with_zero));
     CHECK(aborts(cancels_with_zero));
+
+    CHECK(aborts(puts_a_timeout_on_a_sleep));
     return 0;
 }
