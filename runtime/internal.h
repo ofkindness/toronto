@@ -11,8 +11,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "runtime/future.h"
 #include "runtime/runtime.h"
 #include "runtime/task.h"
+
+/* Settled AWAITs that one poll may pass before the task must let others run. */
+enum { TASK_BUDGET = 32 };
 
 struct runtime {
     task_t *queue_head;     /* run queue: FIFO, linked through task->next */
@@ -21,6 +25,7 @@ struct runtime {
     size_t  tasks;          /* length of `all` */
     size_t  live;           /* tasks that have not finished */
     bool    running;        /* inside runtime_run */
+    bool    shutting_down;  /* inside runtime_free: new tasks start cancelled */
 };
 
 /* Appends an idle or running task to the run queue. */
@@ -33,7 +38,20 @@ void runtime_enqueue(runtime_t *rt, task_t *t);
  */
 void task_wake(task_t *t);
 
+/*
+ * Called when a task's poll function returns POLL_READY. Drops its pending
+ * futures, settles a pending join on it, and frees it if its handle has been
+ * consumed.
+ */
+void task_finish(task_t *t);
+
 /* Unlinks a task from its runtime and frees it together with its frame. */
 void task_free(task_t *t);
+
+/*
+ * Drops every pending future of a task: each becomes idle, and its producer's
+ * drop hook is called.
+ */
+void future_drop_all(task_t *t);
 
 #endif

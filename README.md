@@ -2,7 +2,7 @@
 
 A minimal, single-threaded async runtime in C11, built from scratch to learn how runtimes like Tokio work inside.
 
-**Status: design proposal.** This README is the design. M0 (tooling) and M1 (coroutines without I/O) are implemented. M2 to M5 are not.
+**Status: design proposal.** This README is the design. M0 (tooling), M1 (coroutines without I/O) and M2 (futures, join, cancellation) are implemented. M3 to M5 are not.
 
 ---
 
@@ -178,7 +178,7 @@ runtime_run(rt):
 - Each pass polls only the tasks that were queued when it began. A task that yields therefore runs again only after I/O has been checked, which prevents starvation.
 - Rounding the timeout up avoids a busy loop on a remainder of less than 1 ms.
 - **`runtime_stats`** counts the tasks not yet freed, the entries in the timer heap and the entries in the fd table. Every test ends by checking that all three are 0. This is how end-goal criterion 3 is observed, and it also works on macOS, where LeakSanitizer is not available.
-- **`runtime_free` is a bounded shutdown.** If tasks are still live, for example after `EDEADLK`, it cancels each one with `ECANCELED` and polls until all of them have finished. This always ends, because a cancelled task cannot start an operation and cleanup cannot suspend. It then frees everything, including finished tasks whose handle was never consumed.
+- **`runtime_free` is a bounded shutdown.** If tasks are still live, for example after `EDEADLK`, it cancels each one with `ECANCELED` and polls until all of them have finished. This always ends, because a cancelled task cannot start an operation and cleanup cannot suspend. A task spawned during the shutdown starts cancelled, so the shutdown still ends. It then frees everything, including finished tasks whose handle was never consumed. A task that broke the contract by suspending without a wake cannot be finished, and is freed without its cleanup.
 
 ### Tasks: the task contract
 
@@ -237,9 +237,9 @@ void future_fail(future_t *f, int error);   /* error must be non-zero */
 ```
 
 - A future is one-shot and belongs to one task, its waiter. The waiter is the task that started the operation, and only that task may `AWAIT` the future.
-- **Every operation starts with `future_begin`.** It resets `f` to pending, links it to the waiter `t`, and records the producer's drop hook. If `t` is cancelled, it returns `false` and leaves `f` idle, and the operation must then do nothing.
+- **Every operation starts with `future_begin`.** It resets `f` to pending, links it to the waiter `t`, and records the producer's drop hook. If `t` is cancelled, it returns `false` and leaves `f` idle, and the operation must then do nothing. The waiter calls it from inside its own poll.
 - **Settling** a future unlinks it from its waiter and wakes the waiter.
-- **Dropping.** The runtime calls the drop hook of every future that is still pending when its waiter is cancelled or finishes, and when the future times out. The producer must forget `f` and never touch it again. The reactor, the timer heap and join all work this way, and so must an operation written in user code, so a producer never keeps a pointer into a frame that is gone.
+- **Dropping.** The runtime calls the drop hook of every future that is still pending when its waiter is cancelled or finishes, and when the future times out. The producer must forget `f` and never touch it again, and the hook must not call back into the runtime. The hook may be `NULL` for an operation that settles `f` before it returns. The reactor, the timer heap and join all work this way, and so must an operation written in user code, so a producer never keeps a pointer into a frame that is gone.
 - **A producer that goes away first settles its futures first.** A producer task fails the futures it still holds, for example with `ECANCELED`, in its cleanup.
 - A future must not be copied, moved or reused while it is pending.
 - An operation reports failure **only** through its future, never through a return value. One path, `AWAIT`, therefore handles every async error.
@@ -504,6 +504,7 @@ examples/
 tests/
   test_*.c               one program per test; exit code 0 means pass
   test.h                 CHECK and the runtime_stats check that ends every test
+  slot.h                 the tests' own operations, built on future_begin
 Makefile
 ```
 
@@ -575,12 +576,14 @@ Each milestone is done only when its tests pass under `make test` **and** `make 
   - a failed future propagates to cleanup;
   - a double wake polls only once, and a wake during a poll queues the task again;
   - cancellation before the first poll and while awaiting both reach cleanup with the reason;
-  - a future that settled before the cancel is still delivered;
+  - a future that settled before the cancel is still delivered, and a cancelled task cannot start an operation;
+  - a late cancel does not change the task's error;
   - a task that awaits 100 already settled futures in a row is polled four times;
-  - cancelling the consumer calls the producer's drop hook;
+  - cancelling the consumer calls the producer's drop hook at once, and so does a task that finishes with an operation still pending;
   - a join completes with the child's error code as its value, and a cancelled join leaves the handle with the joiner;
   - a handle that is never consumed shows up in `runtime_stats`;
-  - `runtime_free` finishes tasks that are still live;
+  - `runtime_free` finishes tasks that are still live, and a task spawned during that shutdown starts cancelled;
+  - an `AWAIT` in cleanup, an `AWAIT` with no operation started, a second operation on a pending future and settling a future twice each abort;
   - no leaks.
 
 ### M3 — Poller and timers
