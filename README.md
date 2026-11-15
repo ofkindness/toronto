@@ -2,7 +2,7 @@
 
 A minimal, single-threaded async runtime in C11, built from scratch to learn how runtimes like Tokio work inside.
 
-**Status: design proposal.** This README is the design. M0 (tooling), M1 (coroutines without I/O) and M2 (futures, join, cancellation) are implemented. M3 to M5 are not.
+**Status: design proposal.** This README is the design. M0 (tooling), M1 (coroutines without I/O), M2 (futures, join, cancellation) and M3 (poller and timers) are implemented. M4 and M5 are not.
 
 ---
 
@@ -126,6 +126,7 @@ int       poller_arm(poller_t *p, int fd, unsigned interest);     /* set the fd'
 int       poller_forget(poller_t *p, int fd);                     /* before close() */
 int       poller_wait(poller_t *p, poller_event_t *out, int max,
                       int timeout_ms);                            /* -1 = no timeout */
+/* poller_arm and poller_forget return 0 or an error code; poller_wait returns -1 and sets errno */
 ```
 
 **Contract: one-shot, level-triggered.**
@@ -133,8 +134,8 @@ int       poller_wait(poller_t *p, poller_event_t *out, int max,
 - `poller_arm` replaces the fd's interest with `interest`. Passing 0 disarms the fd.
 - An armed interest delivers at most one event. After an event for an fd, the caller treats *all* of that fd's interest as disarmed, and arms again whatever it still needs.
 - Re-arming while the condition still holds fires again; the readiness is level-based.
-- Errors and hang-ups count as readiness for every armed direction, so the retried system call reports the real error.
-- Readiness is only a hint. Callers always ask the kernel again, and re-arm on `EAGAIN`. An event for a direction that nobody waits on is ignored.
+- Errors and hang-ups count as readiness, so the retried system call reports the real error.
+- Readiness is only a hint. Callers always ask the kernel again, and re-arm on `EAGAIN`. An event for a direction that nobody waits on is ignored. One call of `poller_wait` may also report the same fd twice, once per direction.
 - **The poller keeps no per-fd state.** The armed mask lives in its caller, which is the reactor's fd table.
 - `poller_wait` returns the number of events, or 0 on timeout. It treats `EINTR` as 0 events.
 
@@ -144,7 +145,7 @@ The design is one-shot and level-triggered because that gives no missed wake-ups
 |---|---|---|
 | arm | `epoll_ctl` MOD with `EPOLLONESHOT` and the full mask; on `ENOENT`, ADD | one `kevent` call: `EV_ADD \| EV_ONESHOT` for each direction in the mask, `EV_DELETE` for each direction not in it (`EV_RECEIPT`, ignoring `ENOENT`) |
 | after an event | `EPOLLONESHOT` has disabled the whole fd | only the filter that fired is gone; the other one stays until the next `poller_arm`, and may deliver an event that the caller ignores |
-| error / hang-up | `EPOLLERR`, `EPOLLHUP` → ready for the armed directions | `EV_EOF`, `EV_ERROR` → same |
+| error / hang-up | `EPOLLERR`, `EPOLLHUP` → ready in both directions, because the poller does not know which are armed | `EV_EOF`, `EV_ERROR` arrive on a filter → ready in that filter's direction |
 | forget | `EPOLL_CTL_DEL` | `EV_DELETE` for both filters, ignoring `ENOENT` |
 
 ### Run loop
@@ -153,7 +154,7 @@ The design is one-shot and level-triggered because that gives no missed wake-ups
 typedef struct { size_t tasks, timers, fds; } runtime_stats_t;
 
 runtime_t *runtime_new(void);                        /* NULL + errno on failure */
-int        runtime_run(runtime_t *rt);               /* 0, or EDEADLK */
+int        runtime_run(runtime_t *rt);               /* 0, EDEADLK, or the poller's error */
 void       runtime_free(runtime_t *rt);              /* first cancels and finishes any live task */
 void       runtime_stats(const runtime_t *rt, runtime_stats_t *out);
 uint64_t   runtime_now_ms(const runtime_t *rt);      /* the loop's clock */
@@ -178,7 +179,7 @@ runtime_run(rt):
 - Each pass polls only the tasks that were queued when it began. A task that yields therefore runs again only after I/O has been checked, which prevents starvation.
 - Rounding the timeout up avoids a busy loop on a remainder of less than 1 ms.
 - **`runtime_stats`** counts the tasks not yet freed, the entries in the timer heap and the entries in the fd table. Every test ends by checking that all three are 0. This is how end-goal criterion 3 is observed, and it also works on macOS, where LeakSanitizer is not available.
-- **`runtime_free` is a bounded shutdown.** If tasks are still live, for example after `EDEADLK`, it cancels each one with `ECANCELED` and polls until all of them have finished. This always ends, because a cancelled task cannot start an operation and cleanup cannot suspend. A task spawned during the shutdown starts cancelled, so the shutdown still ends. It then frees everything, including finished tasks whose handle was never consumed. A task that broke the contract by suspending without a wake cannot be finished, and is freed without its cleanup.
+- **`runtime_free` is a bounded shutdown.** If tasks are still live, for example after `EDEADLK`, it cancels each one with `ECANCELED` and polls until all of them have finished. This always ends, because a cancelled task cannot start an operation and cleanup cannot suspend. A task spawned during the shutdown starts cancelled, and the shutdown never waits for a timer, so it still ends. It then frees everything, including finished tasks whose handle was never consumed. A task that broke the contract by suspending without a wake cannot be finished, and is freed without its cleanup.
 
 ### Tasks: the task contract
 
@@ -309,6 +310,7 @@ void future_set_timeout(future_t *f, uint64_t ms);    /* fail a pending f with E
 
 - The timer heap is a binary min-heap of deadlines on `CLOCK_MONOTONIC`, in milliseconds. It holds two kinds of entry: future timers (sleeps and operation timeouts) and task deadlines. Each entry is embedded in its future or its task.
 - Each entry stores its heap index, so cancelling an entry is O(log n).
+- **`task_set_deadline` cannot fail.** The heap array always has room for one deadline per task and for every armed future timer. A task reserves its slot when it is spawned, so `task_spawn` is where running out of memory shows. A sleep or a timeout reserves its slot when it is armed, and fails its future with `ENOMEM` if it cannot.
 - Ties fire in insertion order, so tests are deterministic.
 - `sleep_ms(t, f, 0)` completes on the next pass, after I/O has been checked.
 - The earliest deadline sets the loop's wait timeout. Timers are part of the core because they are the simplest async source, and because the loop cannot compute its timeout without them.
@@ -325,8 +327,8 @@ void future_set_timeout(future_t *f, uint64_t ms);    /* fail a pending f with E
     }
     ```
 
-    It does nothing on a future that is settled or idle. A sleep cannot have a timeout.
-- **Virtual time for tests.** After `runtime_set_virtual_time(rt)`, the clock starts at 0 and the loop never sleeps for a timer. When it would wait for a timer, it polls with a zero timeout instead and, if there are no events, moves the clock to the earliest deadline. Timer tests then run instantly and give the same result on a loaded machine. Tokio's paused clock works the same way.
+    Calling it again replaces the earlier limit. It does nothing on a future that is settled or idle. A sleep cannot have a timeout.
+- **Virtual time for tests.** After `runtime_set_virtual_time(rt)`, the clock starts at 0 and the loop never sleeps for a timer. When it would wait for a timer, it polls with a zero timeout instead and, if there are no events, moves the clock to the earliest deadline. Timer tests then run instantly and give the same result on a loaded machine. Tokio's paused clock works the same way. Set it before any timer is armed. Virtual time only moves when every task is suspended, so a task that yields forever stops the clock.
 
 ### Reactor and I/O
 
@@ -588,14 +590,19 @@ Each milestone is done only when its tests pass under `make test` **and** `make 
 
 ### M3 — Poller and timers
 - `poller.h` with both backends, the timer heap, `sleep_ms`, task deadlines, `future_set_timeout`, virtual time, the loop's timeout computation and `EDEADLK` detection.
-- The timer tests run under virtual time.
+- The loop waits in the poller, but no fd is armed by the runtime yet: that is the reactor, in M4. `test_poller` uses the poller directly.
+- The timer tests run under virtual time. Three checks need the real clock and wait about 20 ms each.
 - **Done:**
-  - three sleeps finish in deadline order;
-  - a cancelled sleep leaves the heap;
-  - a deadline cancels a task with `ETIMEDOUT`;
+  - three sleeps finish in deadline order, and ties in the order they were armed;
+  - a sleep of 0 completes on the next pass;
+  - a cancelled sleep leaves the heap at once;
+  - 200 timers, a third of the longer ones cancelled, all fire exactly on time;
+  - a deadline cancels a task with `ETIMEDOUT`, also a task that only yields;
   - a task that finishes with a deadline still set leaves no timer entry;
+  - setting a deadline again replaces it, and a cleared deadline does not fire;
   - a join with a timeout fails with `ETIMEDOUT`, and the task then joins the same child again;
-  - a pipe test confirms one-shot semantics on both backends;
+  - a timed-out operation is dropped, and a timeout that is not needed is disarmed;
+  - a pipe and a socket pair confirm the poller contract on both backends: one-shot, level-triggered, disarm, forget, hang-up, and both directions on one fd;
   - the ticker task prints the expected output under virtual time, and `examples/ticker.c` runs in real time.
 
 ### M4 — Reactor and non-blocking I/O

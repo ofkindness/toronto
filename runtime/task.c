@@ -37,6 +37,12 @@ task_t *task_spawn(runtime_t *rt, task_fn fn, size_t frame_size)
         errno = ENOMEM;
         return NULL;
     }
+    /* Room in the timer heap for this task's deadline, so setting it cannot fail. */
+    if (timer_reserve(rt, rt->tasks + 1 + rt->future_timers) != 0) {
+        free(t);
+        errno = ENOMEM;
+        return NULL;
+    }
 
     t->fn = fn;
     t->rt = rt;
@@ -64,6 +70,8 @@ void task_free(task_t *t)
 {
     runtime_t *rt = t->rt;
 
+    timer_disarm(rt, &t->deadline);
+
     if (t->all_prev != NULL)
         t->all_prev->all_next = t->all_next;
     else
@@ -82,6 +90,7 @@ void task_finish(task_t *t)
 
     /* The frame may go away now, so no producer may keep a pointer into it. */
     future_drop_all(t);
+    timer_disarm(t->rt, &t->deadline);
 
     if (t->joiner != NULL) {
         future_t *join = t->joiner;
@@ -160,6 +169,24 @@ void task_cancel(task_t *t, int reason)
     t->cancel_reason = reason;
     future_drop_all(t);             /* this part acts immediately */
     task_wake(t);                   /* the rest happens at its next resume point */
+}
+
+void task_set_deadline(task_t *t, uint64_t ms_from_now)
+{
+    uint64_t now;
+
+    if (t == NULL || t->state == TASK_FINISHED)
+        return;
+    now = runtime_now_ms(t->rt);
+    timer_arm(t->rt, &t->deadline, TIMER_DEADLINE, t,
+              ms_from_now > UINT64_MAX - now ? UINT64_MAX : now + ms_from_now);
+}
+
+void task_clear_deadline(task_t *t)
+{
+    if (t == NULL || t->state == TASK_FINISHED)
+        return;
+    timer_disarm(t->rt, &t->deadline);
 }
 
 void task_wake(task_t *t)

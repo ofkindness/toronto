@@ -5,6 +5,7 @@
 #define TORONTO_TASK_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "runtime/runtime.h"
 
@@ -71,9 +72,30 @@ void task_join(task_t *t, task_t *child, future_t *f);
 void task_cancel(task_t *t, int reason);
 
 /*
+ * Cancels the task with ETIMEDOUT once ms_from_now milliseconds have passed.
+ * Setting it again replaces the earlier deadline: for an idle timeout, set
+ * it after every message. The deadline is cleared when the task finishes.
+ * Both do nothing if t is NULL or has finished.
+ */
+void task_set_deadline(task_t *t, uint64_t ms_from_now);
+void task_clear_deadline(task_t *t);
+
+/*
  * Everything below is visible only because the macros in async.h need the
  * resume and flags fields. Use the accessors above.
  */
+
+/*
+ * An entry in the runtime's timer heap. It is embedded in the future or the
+ * task it belongs to, so arming a timer allocates nothing.
+ */
+typedef struct timer_entry {
+    uint64_t deadline;      /* ms on the loop's clock */
+    uint64_t seq;           /* insertion order: breaks ties between equal deadlines */
+    size_t   pos;           /* index in the heap plus 1; 0 = not armed */
+    unsigned kind;          /* what to do when it fires */
+    void    *owner;         /* the future or the task */
+} timer_entry_t;
 
 enum {                      /* task->state */
     TASK_IDLE,              /* suspended and not queued: waiting for a wake */
@@ -101,6 +123,7 @@ struct task {
     void      *frame;
     future_t  *pending;     /* the futures this task has started and not seen settle */
     future_t  *joiner;      /* the pending join on this task, if any */
+    timer_entry_t deadline; /* armed by task_set_deadline */
     task_t    *next;        /* run queue link */
     task_t    *all_prev;    /* the runtime's list of every task not yet freed */
     task_t    *all_next;

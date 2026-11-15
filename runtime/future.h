@@ -37,8 +37,9 @@ intptr_t future_value(const future_t *f);
 
 /*
  * The drop hook. The runtime calls it when the waiter is cancelled or
- * finishes while f is still pending. The producer must forget f and never
- * touch it again. The hook must not call back into the runtime.
+ * finishes while f is still pending, and when f times out. The producer must
+ * forget f and never touch it again. The hook must not call back into the
+ * runtime.
  */
 typedef void (*future_drop_fn)(future_t *f, void *ctx);
 
@@ -76,6 +77,7 @@ struct future {
     void           *ctx;
     future_t       *prev;   /* the waiter's list of pending futures */
     future_t       *next;
+    timer_entry_t   timer;  /* a sleep, or the timeout of another operation */
 };
 
 #endif
