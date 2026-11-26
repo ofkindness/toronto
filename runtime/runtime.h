@@ -7,12 +7,13 @@
 #define TORONTO_RUNTIME_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct runtime runtime_t;
 
 typedef struct {
     size_t tasks;   /* tasks not yet freed */
-    size_t timers;  /* entries in the timer heap (always 0 before M3) */
+    size_t timers;  /* entries in the timer heap */
     size_t fds;     /* entries in the fd table (always 0 before M4) */
 } runtime_stats_t;
 
@@ -21,7 +22,9 @@ runtime_t *runtime_new(void);
 
 /*
  * Runs the loop until no task is live. Returns 0, or EDEADLK if tasks are
- * still live but nothing can wake them. Must not be called from a task.
+ * still live but nothing can wake them: the run queue is empty and no timer
+ * is armed. Returns another error code if the poller fails. Must not be
+ * called from a task.
  */
 int runtime_run(runtime_t *rt);
 
@@ -36,5 +39,22 @@ int runtime_run(runtime_t *rt);
 void runtime_free(runtime_t *rt);
 
 void runtime_stats(const runtime_t *rt, runtime_stats_t *out);
+
+/*
+ * The loop's clock, in milliseconds. It is monotonic, and only differences
+ * between two readings mean anything.
+ */
+uint64_t runtime_now_ms(const runtime_t *rt);
+
+/*
+ * For tests. Switches the runtime to virtual time: the clock starts at 0 and
+ * the loop never sleeps. When it would wait for a timer, it moves the clock
+ * to the earliest deadline instead. Timer tests then run instantly and give
+ * the same result on a loaded machine.
+ *
+ * Call it before any timer is armed. Virtual time only moves when every
+ * task is suspended, so a task that yields forever stops the clock.
+ */
+void runtime_set_virtual_time(runtime_t *rt);
 
 #endif

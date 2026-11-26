@@ -43,6 +43,7 @@ bool future_begin(task_t *t, future_t *f, future_drop_fn drop, void *ctx)
     assert(t->state == TASK_RUNNING &&
            "an operation is started by its waiter, from inside its own poll");
     assert(f->state != FUTURE_PENDING && "operation started on a pending future");
+    assert(f->timer.pos == 0);  /* only a pending future has a timer armed */
 
     f->state = FUTURE_IDLE;
     f->error = 0;
@@ -70,6 +71,7 @@ static void settle(future_t *f, unsigned state, intptr_t value, int error)
 {
     assert(f->state == FUTURE_PENDING && "settling a future that is not pending");
     unlink_pending(f);
+    timer_disarm(f->waiter->rt, &f->timer);     /* its timeout, if it had one */
     f->state = state;
     f->value = value;
     f->error = error;
@@ -89,19 +91,33 @@ void future_fail(future_t *f, int error)
     settle(f, FUTURE_FAILED, 0, error);
 }
 
+/* Drops the operation on one pending future, which becomes idle. */
+static void drop_operation(future_t *f)
+{
+    future_drop_fn drop = f->drop;
+    void *ctx = f->ctx;
+
+    /* Idle before the hook runs, so a hook that settles f is caught. */
+    unlink_pending(f);
+    timer_disarm(f->waiter->rt, &f->timer);     /* a sleep, or a timeout */
+    f->state = FUTURE_IDLE;
+    f->drop = NULL;
+    f->ctx = NULL;
+    if (drop != NULL)
+        drop(f, ctx);
+}
+
 void future_drop_all(task_t *t)
 {
-    while (t->pending != NULL) {
-        future_t *f = t->pending;
-        future_drop_fn drop = f->drop;
-        void *ctx = f->ctx;
+    while (t->pending != NULL)
+        drop_operation(t->pending);
+}
 
-        /* Idle before the hook runs, so a hook that settles f is caught. */
-        unlink_pending(f);
-        f->state = FUTURE_IDLE;
-        f->drop = NULL;
-        f->ctx = NULL;
-        if (drop != NULL)
-            drop(f, ctx);
-    }
+void future_drop_and_fail(future_t *f, int error)
+{
+    assert(f->state == FUTURE_PENDING);
+    drop_operation(f);
+    f->state = FUTURE_FAILED;
+    f->error = error;
+    task_wake(f->waiter);
 }
